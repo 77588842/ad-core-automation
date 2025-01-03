@@ -1,0 +1,612 @@
+<#
+.SYNOPSIS
+   Creates new users via PIPS K2
+.DESCRIPTION
+   This script takes input from variables given to it by K2 and creates
+   a new user to Lion spec
+.PARAMETER <paramName>
+   $firstName - First name of the New Starter
+   $lastName - Last name of the New Starter
+   $middleName - Middle Name of the New Starter
+   $preferredName - PreferredName of the New Starter
+   $country - Country of employment
+   $state - State of employment
+   $office - office of employment
+   $leader - New Starter's leader
+   $title - New Starter's job title
+   $empId - New Starters Payroll ID
+   $empType - Employment Type, Full-Time (0) or Contract (1)
+   $endDate - if Contract, end date must be specified - String format: "dd/MM/yyyy"
+   $company - Company, LDD, BSW, FWP, Bacardi, Bevchain, etc.
+   $department - Department of employment.
+   $checkFlags - Normal:0 - create account with normal checks, Use Existing:1 based on empid or sam account, Skip Duplicate Checks:2
+   $samInput - used for selecting account to update. Can also use empID variable if applicable
+#>
+################################################################################
+# MODIFY THIS VARIABLE TO POINT TO THE LOCATION OF THE CONFIG FILE!! REQUIRED!!#
+################################################################################
+$SCRIPT:ConfigLocation = 'C:\Epad\Epad2.cfg'
+
+################################################################################
+# Initialise Functions                                                         #
+################################################################################
+Get-PSSession | Remove-PSSession
+Get-Module | Remove-Module
+################################################################################
+# Initialise Functions                                                         #
+################################################################################
+function Load-Config {
+
+	if (Test-Path $SCRIPT:ConfigLocation){
+		$config = (Get-Content $SCRIPT:ConfigLocation) -notlike "#*"
+	} else {
+		Report-Failure "Unable to load Config File: file not found!"
+	}
+
+	try{
+		#Exctract Lync Server
+		$LyncServer = ($config -like "*LYNCSERVER=*")[0]
+		$SCRIPT:LyncServer = $LyncServer.Substring($LyncServer.IndexOf("=")+1).Trim()
+
+		#extract Exchange server
+		$ExchangeServer = ($config -like "*EXCHANGESERVER=*")[0]
+		$SCRIPT:ExchangeServer = $ExchangeServer.Substring($ExchangeServer.IndexOf("=")+1).Trim()
+
+		#Extract Primary DC
+		$PrimaryDC = ($config -like "*PRIMARY-DC=*")[0]
+		$SCRIPT:PrimaryDC = $PrimaryDC.Substring($PrimaryDC.IndexOf("=")+1).Trim()
+
+		#extract Smallest Exchange Database File Path
+		$SmallestExchangeDbPath = ($config -like "*SMALLEST-EXCH-DB-PATH=*")[0]
+		$SCRIPT:SmallestExchangeDbPath = $SmallestExchangeDbPath.Substring($SmallestExchangeDbPath.IndexOf("=")+1).Trim()
+
+		#extract Site Matchign XML path
+		$SiteMatchingXmlPath = ($config -like "*SITE-MATCHING-XML-PATH=*")[0]
+		$SCRIPT:SiteMatchingXmlPath = $SiteMatchingXmlPath.Substring($SiteMatchingXmlPath.IndexOf("=")+1).Trim()
+
+		#extract Site Matchign XML path
+		$SapExportPath = ($config -like "*SAP-EXPORT-PATH=*")[0]
+		$SCRIPT:SapExportPath = $SapExportPath.Substring($SapExportPath.IndexOf("=")+1).Trim()
+
+		#extract Lync Pool
+		$LyncPool = ($config -like "*LYNC-POOL=*")[0]
+		$SCRIPT:LyncPool = $LyncPool.Substring($LyncPool.IndexOf("=")+1).Trim()
+
+		#extract AD Module Path
+		$AdModulePath = ($config -like "*AD-MODULE-PATH=*")[0]
+		$SCRIPT:AdModulePath = $AdModulePath.Substring($AdModulePath.IndexOf("=")+1).Trim()
+	} catch {
+		Report-Failure "Error while parsing Config File:`r`n$($error[0])"
+	}
+}
+
+function Sanitise-Input {
+	#Sanitise First Name
+	$GLOBAL:firstName = $GLOBAL:firstName.Trim()
+    #REGEX EXPLANATION -- ONLY ALLOWS LETTERS {L}, NUMBERS {N}, Spaces, Dashes and Apostrophes
+	if([regex]::Match($GLOBAL:firstName,"[^\p{L}\p{N} \-']").Success){
+		Report-Failure "First Name may contain invalid characters - chars matched: $($matches.values)"
+	}
+	#Sanitise Last Name
+	$GLOBAL:lastName = $Global:lastName.Trim()
+    #REGEX EXPLANATION -- ONLY ALLOWS LETTERS {L}, NUMBERS {N}, Spaces, Dashes and Apostrophes
+	if([regex]::Match($GLOBAL:lastName,"[^\p{L}\p{N} \-']").Success){
+		Report-Failure "Last Name may contain invalid characters - chars matched: $($matches.values)"
+	}
+	#Sanitise Preferred Name
+	if ($GLOBAL:preferredName -eq $null){
+		$GLOBAL:preferredName = $GLOBAL:firstName
+	}
+
+	#Build Full-Name
+	$GLOBAL:fullName = $GLOBAL:preferredName + " " + $GLOBAL:lastName
+	#Sanitise MiddleName to Middle Initial
+	try {
+		if ($GLOBAL:middleName.length -gt 0){
+			$GLOBAL:middleName = $GLOBAL:middleName.Trim().Substring(0,1);
+		}
+		#Trim values
+		$GLOBAL:country = $GLOBAL:country.Trim()
+		$GLOBAL:state = $GLOBAL:state.Trim()
+		$GLOBAL:office = $GLOBAL:office.Trim()
+		$GLOBAL:title = $GLOBAL:title.Trim()
+		$GLOBAL:company = $company.Trim()
+		$GLOBAL:department = $department.Trim()
+		$GLOBAL:empId = [int]$GLOBAL:empId
+		$GLOBAL:empType = [int]$GLOBAL:empType
+	} catch {
+		Report-Failure "Unable to process input variables, incorrect format:`r`rSee:$^`r`n$($error[0])"
+	}
+    
+    if ($GLOBAL:Leader.length -lt 1) {
+        Report-Failure "Cannot proceed. A leader must be specified."
+    }
+    
+	try{
+		#Convert Leader SamAccountName into DistinguishedName
+		$GLOBAL:leader = (Get-ADUser $leader.Trim()).DistinguishedName
+	} catch {
+		Report-Failure "Unable to get Leader AD Object:`r`n$($error[0])"
+	}
+
+	#convert endDate string into DateTime value
+	if ($empType -eq 1){
+		$Error.Clear()
+		try{
+			$GLOBAL:endDate = [datetime]::parse($GLOBAL:endDate)
+		} catch {
+			Report-Failure "Account Expiration Date not in expected format or is missing.`r`r$($error[0])"
+		}
+	} else {
+		$GLOBAL:endDate = 0;
+	}
+	#Get OU based of country and contract status
+	if ($GLOBAL:country -eq "Australia"){ 
+		$Global:OrganizationalUnit = "aunz.lncorp.net/AU/LNNF/Users"
+		if ($GLOBAL:empType -eq 1) {$Global:OrganizationalUnit += "/Contractors"}
+	}
+	elseif ($GLOBAL:country -eq "New Zealand"){
+		$Global:OrganizationalUnit = "aunz.lncorp.net/NZ/LNNF/Users"
+		if ($GLOBAL:empType -eq 1) {$Global:OrganizationalUnit += "/Contractors"}
+	} 
+	elseif ($GLOBAL:country -eq "US"){
+		$Global:OrganizationalUnit = "aunz.lncorp.net/US/LN/Users"
+	}
+	else {$Global:OrganizationalUnit = "aunz.lncorp.net/AU/LNNF/Users"}
+}
+
+function ConnectTo-Exchange {
+	$Error.Clear()
+	$retry = 0
+	While ((Get-PSSession | Where{$_.Name -eq "EpAD Exchange"}) -eq $null -and $retry -lt 3) {
+		$retry++
+		try {
+			$Error.Clear()
+			$server = $SCRIPT:ExchangeServer
+			$config = "Microsoft.Exchange";
+			$URI = "http://"+$server + ":80/PowerShell/"
+
+			$sessionOptions = New-PSSessionOption -ProxyAccessType NoProxyServer
+
+			$exchangeSession = New-PSSession `
+			-ConfigurationName $config `
+			-ConnectionURI $URI `
+			-Authentication "Kerberos" `
+			-SessionOption $sessionOptions `
+			-AllowRedirection `
+			-Name "EpAD Exchange" 
+
+			[void](Import-PSSession $exchangeSession -AllowClobber -DisableNameChecking)
+		} catch {}
+	}
+
+	if ($retry -ge 3) {
+		Report-Failure "Error connecting to Exchange, connection timed out"
+	}
+	if ($error.Count -gt 0) {
+		Report-Failure "Error connecting to exchange, an unknown error occurred:`r`n$($error[0])"
+	}
+}
+
+function ConnectTo-Lync {
+	$Error.Clear()
+	$retry = 0
+	While ((Get-PSSession | Where{$_.Name -eq "EpAD Lync"}) -eq $null -and $retry -lt 3) {
+		$retry++
+		try{
+			$server = $SCRIPT:LyncServer
+			$URI = "https://"+$server + "/OcsPowershell"
+			$sessionOptions = New-PSSessionOption -ProxyAccessType NoProxyServer `
+			-SkipRevocationCheck
+
+			# put it all together into the session
+			$LyncSession = New-PSSession `
+			-ConnectionURI $URI `
+			-Authentication NegotiateWithImplicitCredential `
+			-SessionOption $sessionOptions `
+			-Name 'EpAD Lync'
+
+			[Void](Import-PSSession $LyncSession -AllowClobber -DisableNameChecking)
+		} catch {}
+	}
+
+	if ($retry -ge 3) {
+		Report-Failure "Error connecting to Lync, connection timed out"
+	}
+	if ($Error.Count -gt 0){
+		Report-Failure "Error connecting to Lync, unknown error occurred:`r`n$($error[0])"
+	}
+}
+
+function ConnectTo-ActiveDirectory {
+	$Error.Clear()
+	try {Import-Module $SCRIPT:AdModulePath}
+	catch {Report-Failure "Error importing Active Directory Module:`r`n$($error[0])"}
+}
+
+function FindDuplicate-EmpID {
+	$Error.Clear()
+	try {
+		$empId = $GLOBAL:empId
+		$match = Get-ADUser -filter {employeeID -eq $empId} -Server $GLOBAL:PrimaryDC `
+		-Properties employeeID,manager,enabled | Select Name,Enabled,SamAccountName,employeeID,Manager
+		if ($match -ne $null){
+			Report-Failure "Duplicate Employee ID found: $($matches | format-list | Out-String)"
+		}
+	} catch {
+		Report-Failure "Error while checking for Duplicate Employee ID:`r`n$($error[0])"
+	}
+}
+
+function FindDuplicate-Name {
+	$Error.Clear()
+	try {
+		$fullname = $GLOBAL:FullName
+        $date = [datetime]::Now.AddDays(-90)
+		$match = Get-ADUser -filter {name -eq $fullName -and (enabled -eq $true -or (enabled -eq $false -and whenChanged -gt $date))} -Server $GLOBAL:PrimaryDC `
+		-Properties employeeID,manager,enabled | Select Name,Enabled,SamAccountName,employeeID,Manager
+
+		if ($match -ne $null){
+        
+            if ($match.employeeID -eq $GLOBAL:empId) {
+                $GLOBAL:samInput = $match.SamAccountName
+                Use-ExistingAccount
+            } else {
+			    Report-Failure "Duplicate Name Found: $($matches | format-list | Out-String)"
+            }
+		}
+	} catch {
+		Report-Failure "Error while checking for Duplicate Name:`r`n$($error[0])"
+	}
+}
+
+Function CheckAgainstSAPExport ($userID){
+	#Load SAPUsers.csv file (contains list of usernames)
+	try {
+		$SAPUsers = Get-Content $SCRIPT:SapExportPath
+	} catch {
+		Report-Failure "Unable to read SAP Export file:`r`n$($error[0])"
+	}
+	$inSap = ($SAPUsers -contains $UserID)
+	return $inSap;
+}
+
+function Generate-SamAccountName {
+
+	#Defining Local Variable    
+	#Remove all non-unicode chars not letters or numbers
+	$nameFirst = [regex]::Replace($GLOBAL:firstName,"[^\p{L}\p{N}]","").ToLower();
+	$nameLast = [regex]::Replace($GLOBAL:lastName,"[^\p{L}\p{N}]","").ToLower();
+
+	$samLength = 8
+	$fnLength = $NameFirst.Length
+	$lnLength = $NameLast.Length
+
+	#Store length of shortest name in $samLength to control looping
+	if ($fnLength -lt 8) {$samLength = $fnLength}
+	if ($lnLength -lt $samLength) {$samLength = $lnLength}
+
+	#Avoid truncating last letter of lastname if length is less than 8
+	if ($lnLength -lt 8) {$lnLength += 1}
+
+	#If lastname is greater than 8 chars, reduce length variable to 8
+	if ($lnLength -gt 8) {$lnLength = 8}
+
+	#Loop through all possible fn + ln combinations until match is found
+	For($i = 1; $i -lt $samLength;$i++) {
+		$potentialSAM = $NameFirst.substring(0,$i)+$NameLast.substring(0,$lnLength - $i)
+
+		if ($potentialSAM.Length -gt 3) {
+			$CheckSAM = Get-ADUser -Filter {SamAccountName -eq $potentialSAM} -Server $SCRIPT:PrimaryDC
+			#Check against AD and SAP username Export
+			if($CheckSAM -eq $null -and !(CheckAgainstSAPExport $potentialSAM)) {
+
+				"DONE!" | Out-Default
+				[string]$GLOBAL:NewSamAccountName = [string]$potentialSAM
+				return;
+			}
+			elseif ($potentialSAM.length -lt 8)
+			{
+				$lnLength ++
+				$samLength ++
+			}
+		}
+		#Contingency for short names
+		else {
+			$samLength ++
+			$lnLength ++
+		}
+	}
+
+	Report-Failure "Error getting SAM Account Name: Unable to generate unique value:`r`n$($error[0])"
+}
+
+function Generate-DisplayName {
+	$suffix = 0
+	$Error.Clear()
+	try {
+		$GLOBAL:DisplayName = $GLOBAL:fullName
+
+		#Convert OU into DN Format
+		$CN = $Global:OrganizationalUnit.split("/.");
+		[string]$DNparts = $null
+		$domain = "DC="+$CN[0]+",DC="+$CN[1]+",DC="+$CN[2]
+		for ($i = $CN.Count-1;$i -ge 3;$i--){
+			$DNparts += "OU="+$CN[$i]+","
+		}
+		$OU = $DNparts + $domain
+
+		#Check for Unique DN
+		$ProposedDN = "CN="+$GLOBAL:DisplayName + ","+$OU
+		if ((Get-ADUser -Filter {DistinguishedName -eq $ProposedDN} -Server $GLOBAL:PrimaryDC) -ne $null) {
+			if ($GLOBAL:middlename.length -gt 0) {
+				$GLOBAL:DisplayName = $GLOBAL:FirstName + " " + $GLOBAL:middleName + " " + $GLOBAL:LastName
+				$ProposedDN = "CN="+$GLOBAL:DisplayName + ","+$OU
+			}
+			While ((Get-ADUser -Filter {DistinguishedName -eq $ProposedDN} -Server $GLOBAL:PrimaryDC) -ne $null) {
+				$suffix++
+				$GLOBAL:DisplayName += $suffix
+				$ProposedDN = "CN="+$GLOBAL:DisplayName + ","+$OU
+			}
+		}
+		ECHO $GLOBAL:DisplayName
+	} catch {
+		Report-Failure "Error while generating Distinguished Name:`r`n$($error[0])"
+	}
+}
+
+function Generate-Password {
+	$Error.Clear()
+	try {
+		$PWNumbers = Get-Random -Maximum 1000000 -Minimum 100000
+		$PWLetters = "lion"
+		[string]$NewPassword = [string]$PWLetters + [string]$PWNumbers
+	} catch {
+		Report-Failure "Error while generating Password:`r`n$($error[0])"
+	} 
+
+	[string]$GLOBAL:NewPassword = $NewPassword
+}
+
+function Get-SmallestExchangeDatabase {
+	$Error.clear()
+	try {
+		$SCRIPT:SmallestExchDb = ((Get-Content $SCRIPT:SmallestExchangeDbPath) -like "*primary*")[0]
+		$SCRIPT:SmallestExchArchDB = ((Get-Content $SCRIPT:SmallestExchangeDbPath) -like "*archive*")[0]
+	} catch {
+		Report-Failure "Error getting Smallest Exchange Database:`r`n$($error[0])"
+	}
+}
+
+function Create-UserMailbox {
+	$Error.Clear()
+	try{
+		New-Mailbox `
+		-UserPrincipalName "$($GLOBAL:NewSamAccountName)@aunz.lncorp.net" `
+		-Alias $GLOBAL:NewSamAccountName `
+		-Database $SCRIPT:SmallestExchDB `
+		-Name $GLOBAL:DisplayName `
+		-OrganizationalUnit $GLOBAL:OrganizationalUnit `
+		-Password (ConvertTo-SecureString $GLOBAL:NewPassword -AsPlainText -Force) `
+		-FirstName $GLOBAL:FirstName `
+		-LastName $GLOBAL:LastName `
+		-DisplayName $GLOBAL:FullName `
+		-ResetPasswordOnNextLogon $true `
+		-Archive `
+		-ArchiveDatabase $SCRIPT:SmallestExchArchDB `
+		-DomainController $SCRIPT:PrimaryDC
+
+		if (!$?){
+			Report-Failure "Unable to create mailbox:`r`n$($error[0])"
+		}
+	} catch {
+		Report-Failure "Unable to create mailbox:`r`n$($error[0])"
+	}
+}
+
+function Update-UserDetails {
+
+	#Put details into Hash Table
+	$detailsHash = @{
+		physicalDeliveryOfficeName = $GLOBAL:office;
+		st = $GLOBAL:state;
+		manager = $GLOBAL:leader
+		initials = $GLOBAL:middleName;
+		company = $GLOBAL:company;
+		department = $GLOBAL:department;
+		title = $GLOBAL:title;
+		employeeID = $GLOBAL:empID;
+		info="Modified by EpAD2.0 $(Get-Date -format 'dd/MM/yyyy HH:mm')";
+        ExtensionAttribute10 = $ENV:USERNAME;
+	}
+
+	$copy = $detailsHash.Clone()
+	ForEach ($item in $copy.keys) {
+		$val = $detailsHash.get_Item($item)
+		if ($val -eq $null -or $val -eq ""){
+			$detailsHash.Remove($item)
+			echo "Removing $item"
+		}
+	}
+
+
+	While ((Get-ADuser $GLOBAL:NewSamAccountName -server $SCRIPT:PrimaryDC) -eq $null){
+		sleep -Seconds 15
+	}
+    
+    $dn = (Get-ADuser $GLOBAL:NewSamAccountName -server $SCRIPT:PrimaryDC).DistinguishedName
+    
+	$Error.Clear()
+	try {
+		if ($GLOBAL:empType -eq 0){
+			Set-ADUser $GLOBAL:NewSamAccountName -server $GLOBAL:PrimaryDC `
+			-AccountExpirationDate $null `
+			-Replace $detailsHash;
+
+			Set-Mailbox $dn -EmailAddressPolicyEnabled $false -DomainController $SCRIPT:PrimaryDC -ea STOP
+			Set-Mailbox $dn -EmailAddressPolicyEnabled $true -DomainController $SCRIPT:PrimaryDC -ea STOP
+            
+            $upn = (Get-Mailbox $dn | Select PrimarySmtpAddress).PrimarySmtpAddress
+            Set-ADUser $dn -UserPrincipalName $upn -server $GLOBAL:PrimaryDC
+
+		} elseif ($GLOBAL:empType -eq 1){
+			Set-ADUser $GLOBAL:NewSamAccountName -server $GLOBAL:PrimaryDC `
+			-AccountExpirationDate $GLOBAL:EndDate `
+			-Replace $detailsHash;
+
+			Set-Mailbox $dn -EmailAddressPolicyEnabled $false -DomainController $SCRIPT:PrimaryDC -ea STOP
+			Set-Mailbox $dn -EmailAddressPolicyEnabled $true -DomainController $SCRIPT:PrimaryDC -ea STOP
+            
+            $upn = (Get-Mailbox $dn | Select PrimarySmtpAddress).PrimarySmtpAddress
+            Set-ADUser $dn -UserPrincipalName $upn -server $GLOBAL:PrimaryDC
+		}
+	} catch {
+		Report-Failure "Error updating new user details:`r`n$^,$($error[0].exception)"
+	}
+}
+
+function Create-LyncAccount {
+	$Error.Clear()
+	try{
+		Enable-CsUser `
+		-Identity $GLOBAL:NewSamAccountName `
+		-SipAddressType 'EmailAddress' `
+		-RegistrarPool $SCRIPT:LyncPool `
+		-DomainController $SCRIPT:PrimaryDC
+		if (!$?){Report-Failure "Error occurred creating Lync account:`r`n$($error[0])"}
+	} catch {
+		Report-Failure "Error occurred creating Lync account:`r`n$($error[0])"
+	}
+}
+
+function Report-Success {
+	$Error.Clear()
+	$GLOBAL:exitCode = $true;
+	break;
+}
+
+function Report-Failure ($message) {
+	$GLOBAL:exitCode = $false;
+	$GLOBAL:exitMessage = $message;
+	break;
+}
+
+function Use-ExistingAccount {
+    try {
+        $empIdl = $GLOBAL:empId
+        if ($empIdl -eq $null) {$empIdl = "NOTMATCHANY"}
+        $existingUser = @(Get-ADUser -Filter {employeeId -eq $empIdl -or samAccountName -eq $samInput} -Server $SCRIPT:PrimaryDC -Properties LastLogonTimestamp,Country)
+        
+        if ($existingUser.count -ne 1){
+            Report-Failure "No Existing User Found"
+        } else {$existingUSer = $existingUser[0]}
+        #If user has logged on in the last 90 days, update user
+    	if ($existingUser.LastLogonTimestamp -gt [datetime]::Now.AddDays(-90).ToFileTime() -or $existingUser.LastLogonTimestamp -eq $Null){
+    		$GLOBAL:NewSamAccountName = $existingUser.SamAccountName
+    		$GLOBAL:NewPassword = "Use existing password"
+            
+            #if user is disabled, move to active container and enable account
+            if ($existingUser.enabled -eq $false) {
+                Switch ($existingUser.Country) {
+                    "AU" {$ou = "aunz.lncorp.net/AU/LNNF/Users";break;}
+                    "NZ" {$ou = "aunz.lncorp.net/NZ/LNNF/Users";break;}
+                    "MY" {$ou = "aunz.lncorp.net/MY/Users";break;}
+                    "US" {$ou = "aunz.lncorp.net/US/LNNF/Users";break;}
+                    default {$ou = "aunz.lncorp.net/AU/LNNF/Users";}
+                }
+                
+                Move-ADObject $existingUser.DistinguishedName -TargetPath $ou -Server $SCRIPT:PrimaryDC -confirm:$false
+                Enable-ADAccount $existingUser.SamAccountName -Server $SCRIPT:PrimaryDC -confirm:$false
+            }            
+            
+            #Update Details with supplied info
+    		Update-UserDetails
+    		Report-Success
+    	} else {
+    		Report-Failure "Existing User has not logged on for more than 90 days, please create new account (skip checks) or log a call with enable.me for more help."
+    	}
+    } catch {
+        Report-Failure "An error occurred while attempting to update an existing user:`r`n$$"
+    }
+
+}
+
+
+################################################################################
+# Perform New User Operations, Step by Step as shown                           #
+################################################################################
+Try {
+	# LOAD CONFIGURATION
+	Load-Config
+
+	#1. Connect to Exchange/Lync/AD
+	ConnectTo-Lync
+	ConnectTo-Exchange
+	ConnectTo-ActiveDirectory
+
+	#2. Convert variables to Global Scope and Sanitise Input
+	$GLOBAL:firstName = $firstName
+	$GLOBAL:lastName = $lastName
+	$GLOBAL:middleName = $middleName
+	$GLOBAL:preferredName = $preferredName
+	$GLOBAL:country = $country
+	$GLOBAL:state = $state
+	$GLOBAL:office = $office
+	$GLOBAL:leader = $leader
+	$GLOBAL:title = $title
+	$GLOBAL:empId = $empId
+	$GLOBAL:empType = $empType
+	$GLOBAL:endDate = $endDate
+	$GLOBAL:company = $company
+	$GLOBAL:department = $department
+    
+
+	Sanitise-Input
+
+	#If we are using an existing account, perform only these operations
+	if ($checkFlags -eq 1) {
+        $GLOBAL:samInput = $samInput.trim()
+        
+        Use-ExistingAccount
+        
+	}
+	else {
+		if ($checkFlags -ne 2){
+			#3. Check for Duplicate Employee ID or Name
+			FindDuplicate-EmpID
+			FindDuplicate-Name
+		}
+		#4. Generate SamAccountName/CanonicalName/Password
+		Generate-SamAccountName
+		Generate-DisplayName
+		Generate-Password
+
+		#5. Get Smallest Exchange DB from File
+		Get-SmallestExchangeDatabase
+
+		#6. Create Mailbox & ArchiveMailbox
+		Create-UserMailbox
+        
+        #Wait for replication to ensure Lync creation doesn't fail.
+        try {
+            $samtest = $GLOBAL:NewSamAccountName
+            While((Get-ADUser -Filter {samAccountName -eq $samtest} -Server $lyncDC) -eq $null) {
+                Start-Sleep -Seconds 5
+            }
+        } catch {
+            Report-Failure "Error checking for account on LyncDC priopr to LYnc Setup"
+        }
+        
+		#7. Update AD Details
+		Update-UserDetails
+
+		#8. Create Lync Account
+		Create-LyncAccount
+
+		#9. Report New User Details to K2
+		Report-Success
+	}
+    
+} catch {
+	Report-Failure "An error occurred during script execution:`r`n$^ :: $$ :: $($error[0].exception)"
+}
